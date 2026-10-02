@@ -200,11 +200,13 @@ management:
   endpoints:
     web:
       exposure:
-        include:
-          - health
-          - info
-          - metrics
-          - prometheus
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+        add-additional-paths: true
 
   health:
     circuitbreakers:
