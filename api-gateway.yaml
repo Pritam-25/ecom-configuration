@@ -1,0 +1,305 @@
+# ==============================================================================
+# API GATEWAY BASE CONFIGURATION (Default Profile)
+# ==============================================================================
+# Service Name : api-gateway
+# Framework    : Spring Cloud Gateway (WebFlux / Reactor Netty)
+# Standards    : RFC 9457 (Problem Details), OpenTelemetry Distributed Tracing
+# Discovery    : Netflix Eureka (Client Fetch Registry + LoadBalancer)
+# ==============================================================================
+
+# ==============================================================================
+# 1. Embedded HTTP Server (Reactor Netty)
+# ==============================================================================
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  # Netty max HTTP header size: Set above the 16KB Gateway filter limit so Netty
+  # decodes headers up to 32KB, allowing the Gateway filter to reject oversized
+  # headers with a clean 431 RFC 9457 ProblemDetail instead of dropping connections.
+  max-http-request-header-size: ${SERVER_MAX_HTTP_REQUEST_HEADER_SIZE:32KB}
+
+# ==============================================================================
+# 2. Spring Core & Infrastructure Configuration
+# ==============================================================================
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 15s
+
+  # ----------------------------------------------------------------------------
+  # 2.1 Security & OAuth2 JWT Resource Server
+  # ----------------------------------------------------------------------------
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Public RSA key used for stateless token validation and signature verification
+          public-key-location: ${JWT_PUBLIC_KEY_LOCATION:classpath:certs/public.pem}
+
+  # ----------------------------------------------------------------------------
+  # 2.2 Spring Cloud Gateway (Routing, CORS & Filters)
+  # ----------------------------------------------------------------------------
+  cloud:
+    circuitbreaker:
+      resilience4j:
+        # Disable TimeLimiter so Netty's native response-timeout governs downstream latency
+        disable-time-limiter: true
+    gateway:
+      server:
+        webflux:
+
+          # --------------------------------------------------------------------
+          # HTTP Client Timeouts (Reactor Netty Downstream Connections)
+          # Global Safety Ceiling: connect <= 2s, response <= 5s
+          # --------------------------------------------------------------------
+          httpclient:
+            connect-timeout: ${GATEWAY_CONNECT_TIMEOUT_MS:2000}
+            response-timeout: ${GATEWAY_RESPONSE_TIMEOUT:5s}
+
+          # --------------------------------------------------------------------
+          # Global CORS Policy (Browser Security)
+          # --------------------------------------------------------------------
+          globalcors:
+            add-to-simple-url-handler-mapping: true
+            cors-configurations:
+              '[/**]':
+                allowed-origins:
+                  - "http://localhost:3000"
+                allowed-methods:
+                  - GET
+                  - POST
+                  - PUT
+                  - PATCH
+                  - DELETE
+                  - OPTIONS
+                allowed-headers:
+                  - Authorization
+                  - Content-Type
+                  - X-Request-ID
+                allow-credentials: false
+                max-age: 3600
+
+          # --------------------------------------------------------------------
+          # Route Definitions
+          # Filter Execution Order:
+          #   1. RequestHeaderSize   (Fail-fast on oversized headers)
+          #   2. RequestSize         (Fail-fast on oversized payloads before Redis token consumption)
+          #   3. RequestRateLimiter  (Distributed token-bucket rate limiting)
+          #   4. CircuitBreaker      (Fail-fast on cascading upstream failures)
+          #   5. RewritePath         (Strip edge prefix before proxying downstream)
+          # --------------------------------------------------------------------
+          routes:
+
+            # ------------------------------------------------------------------
+            # Route 1: Auth Service (Identity & Authentication)
+            # ------------------------------------------------------------------
+            - id: auth-service
+              uri: ${services.auth-service.url:lb://auth-service}
+              predicates:
+                - Path=/api/v1/auth/**
+              metadata:
+                connect-timeout: ${GATEWAY_ROUTE_AUTH_CONNECT_TIMEOUT:2000}
+                response-timeout: ${GATEWAY_ROUTE_AUTH_RESPONSE_TIMEOUT:3000}
+              filters:
+                # 1. Header size protection (16 KB per header limit)
+                - name: RequestHeaderSize
+                  args:
+                    maxSize: ${gateway.request-protection.header.max-size:16KB}
+                    errorHeaderName: X-Gateway-Internal-Error
+                # 2. Request body size protection (256 KB auth payload limit)
+                - name: RequestSize
+                  args:
+                    maxSize: ${gateway.request-protection.body.auth.max-size:256KB}
+                # 3. Anonymous Client-IP Rate Limiting (Redis Token Bucket)
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@authClientIpKeyResolver}"
+                    redis-rate-limiter.replenishRate: ${gateway.rate-limit.auth.replenish-rate:5}
+                    redis-rate-limiter.burstCapacity: ${gateway.rate-limit.auth.burst-capacity:10}
+                    redis-rate-limiter.requestedTokens: ${gateway.rate-limit.auth.requested-tokens:1}
+                    deny-empty-key: true
+                    empty-key-status-code: "BAD_REQUEST"
+                    throw-on-limit: true
+                # 4. Circuit Breaker protection (Fail-fast on cascading upstream failures)
+                - name: CircuitBreaker
+                  args:
+                    name: authServiceCircuitBreaker
+                    statusCodes:
+                      - 500
+                      - 502
+                      - 503
+                      - 504
+                # 5. Strip edge prefix: /api/v1/auth -> /auth
+                - RewritePath=/api/v1/auth, /auth
+
+            # ------------------------------------------------------------------
+            # Route 2: Order Service (Order Management & Fulfillment)
+            # ------------------------------------------------------------------
+            - id: order-service
+              uri: ${services.order-service.url:lb://order-service}
+              predicates:
+                - Path=/api/v1/orders/**
+              metadata:
+                connect-timeout: ${GATEWAY_ROUTE_ORDER_CONNECT_TIMEOUT:2000}
+                response-timeout: ${GATEWAY_ROUTE_ORDER_RESPONSE_TIMEOUT:5000}
+              filters:
+                # 1. Header size protection (16 KB per header limit)
+                - name: RequestHeaderSize
+                  args:
+                    maxSize: ${gateway.request-protection.header.max-size:16KB}
+                    errorHeaderName: X-Gateway-Internal-Error
+                # 2. Request body size protection (512 KB order payload limit)
+                - name: RequestSize
+                  args:
+                    maxSize: ${gateway.request-protection.body.order.max-size:512KB}
+                # 3. Authenticated User Rate Limiting (Scoped to JWT Subject)
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@authenticatedUserKeyResolver}"
+                    redis-rate-limiter.replenishRate: ${gateway.rate-limit.order.replenish-rate:1}
+                    redis-rate-limiter.burstCapacity: ${gateway.rate-limit.order.burst-capacity:3}
+                    redis-rate-limiter.requestedTokens: ${gateway.rate-limit.order.requested-tokens:1}
+                    deny-empty-key: true
+                    empty-key-status-code: "BAD_REQUEST"
+                    throw-on-limit: true
+                # 4. Circuit Breaker protection (Fail-fast on cascading upstream failures)
+                - name: CircuitBreaker
+                  args:
+                    name: orderServiceCircuitBreaker
+                    statusCodes:
+                      - 500
+                      - 502
+                      - 503
+                      - 504
+                # 5. Strip edge prefix: /api/v1/orders -> /orders
+                - RewritePath=/api/v1/orders, /orders
+
+  # ----------------------------------------------------------------------------
+  # 2.3 Redis Connection Configuration (Rate Limiter Store)
+  # ----------------------------------------------------------------------------
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: ${REDIS_TIMEOUT:2000ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:2000ms}
+
+# ==============================================================================
+# 3. Downstream Services Target Routing (Direct URL or Eureka LoadBalancer)
+# ==============================================================================
+services:
+  auth-service:
+    url: ${SERVICES_AUTH_SERVICE_URL:lb://auth-service}
+  order-service:
+    url: ${SERVICES_ORDER_SERVICE_URL:lb://order-service}
+
+# ==============================================================================
+# 4. Observability & Production Monitoring (Actuator & OpenTelemetry)
+# ==============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include:
+          - health
+          - info
+          - metrics
+          - prometheus
+
+  health:
+    circuitbreakers:
+      enabled: true
+    ratelimiters:
+      enabled: true
+
+  tracing:
+    sampling:
+      probability: ${MANAGEMENT_TRACING_SAMPLING_PROBABILITY:1.0}
+
+  opentelemetry:
+    resource-attributes:
+      service.name: api-gateway
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
+  metrics:
+    distribution:
+      percentiles-histogram:
+        spring.cloud.gateway.requests: true
+    tags:
+      application: ${spring.application.name}
+
+# ==============================================================================
+# 5. Gateway Operational Properties (Custom Policy Knobs)
+# ==============================================================================
+gateway:
+
+  # ----------------------------------------------------------------------------
+  # 5.1 Client-IP Resolution & Trusted Proxy Configuration
+  #   0 = Direct connections (browser -> gateway), XFF is ignored to prevent spoofing
+  #   N = Number of trusted upstream reverse proxies (e.g. Cloudflare, ALB)
+  # ----------------------------------------------------------------------------
+  client-ip:
+    max-trusted-index: ${GATEWAY_CLIENT_IP_MAX_TRUSTED_INDEX:0}
+
+  # ----------------------------------------------------------------------------
+  # 5.2 Request Protection Policies (Headers & Body Limits)
+  # ----------------------------------------------------------------------------
+  request-protection:
+    header:
+      max-size: ${GATEWAY_MAX_REQUEST_HEADER_SIZE:16KB}
+    body:
+      auth:
+        max-size: ${GATEWAY_AUTH_MAX_REQUEST_BODY_SIZE:256KB}
+      order:
+        max-size: ${GATEWAY_ORDER_MAX_REQUEST_BODY_SIZE:512KB}
+
+  # ----------------------------------------------------------------------------
+  # 5.3 Rate Limiter Policies (Tokens / Second & Burst Capacities)
+  # ----------------------------------------------------------------------------
+  rate-limit:
+    auth:
+      replenish-rate: ${GATEWAY_RATE_LIMIT_AUTH_REPLENISH_RATE:5}
+      burst-capacity: ${GATEWAY_RATE_LIMIT_AUTH_BURST_CAPACITY:10}
+      requested-tokens: ${GATEWAY_RATE_LIMIT_AUTH_REQUESTED_TOKENS:1}
+    order:
+      replenish-rate: ${GATEWAY_RATE_LIMIT_ORDER_REPLENISH_RATE:1}
+      burst-capacity: ${GATEWAY_RATE_LIMIT_ORDER_BURST_CAPACITY:3}
+      requested-tokens: ${GATEWAY_RATE_LIMIT_ORDER_REQUESTED_TOKENS:1}
+
+# ==============================================================================
+# 6. Resilience4j Circuit Breaker Configuration
+# ==============================================================================
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: ${GATEWAY_CB_SLIDING_WINDOW_SIZE:10}
+        minimum-number-of-calls: ${GATEWAY_CB_MIN_CALLS:5}
+        failure-rate-threshold: ${GATEWAY_CB_FAILURE_RATE_THRESHOLD:50.0}
+        wait-duration-in-open-state: ${GATEWAY_CB_WAIT_OPEN:10s}
+        permitted-number-of-calls-in-half-open-state: ${GATEWAY_CB_HALF_OPEN_CALLS:2}
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      authServiceCircuitBreaker:
+        base-config: default
+      orderServiceCircuitBreaker:
+        base-config: default
+
+# ==============================================================================
+# 7. Eureka Service Discovery Client
+# ==============================================================================
+eureka:
+  client:
+    register-with-eureka: ${EUREKA_CLIENT_REGISTER_WITH_EUREKA:false}
+    fetch-registry: ${EUREKA_CLIENT_FETCH_REGISTRY:true}
+
+# ==============================================================================
+# 8. Logging Configuration
+# ==============================================================================
+logging:
+  level:
+    com.maityp394.apigateway: ${LOG_LEVEL_GATEWAY:DEBUG}
